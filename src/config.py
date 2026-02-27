@@ -60,6 +60,17 @@ class Settings:
         else:
             load_dotenv()
 
+        # Streamlit Cloud の secrets から環境変数に反映
+        try:
+            import streamlit as st
+            if hasattr(st, "secrets"):
+                for key in ["ANTHROPIC_API_KEY", "NOTE_GENERATOR_MODEL",
+                            "NOTE_GENERATOR_DB_PATH", "NOTE_GENERATOR_OUTPUT_DIR"]:
+                    if key in st.secrets and not os.getenv(key):
+                        os.environ[key] = st.secrets[key]
+        except Exception:
+            pass
+
         # 必須: Anthropic APIキー
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
