@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "note-ai-generator"
+version = "0.1.0"
+description = "AI-powered article generator for note.com"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pdfplumber>=0.10.0",
+    "python-dotenv>=1.0.0",
+    "lxml>=5.0.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0", "pytest-asyncio>=0.21.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[project.scripts]
+note-gen = "src.cli:cli"

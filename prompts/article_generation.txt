@@ -1,0 +1,25 @@
+以下の条件で、note.comに投稿する記事を生成してください。
+
+## トピック
+{topic}
+
+## 文字数目標
+{target_length}文字（{min_length}〜{max_length}文字）
+
+## スタイル指示
+{style_instructions}
+
+## 参考コンテンツ
+以下のコンテンツを参考にして、独自の視点で記事を書いてください：
+{source_content}
+
+## 構成パターン
+{writing_pattern}
+
+## 出力形式
+以下のフォーマットで出力してください：
+
+TITLE: [記事タイトル]
+HASHTAGS: [ハッシュタグ1, ハッシュタグ2, ...]
+---
+[本文（Markdown形式）]
