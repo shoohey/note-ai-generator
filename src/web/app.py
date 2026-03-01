@@ -1,5 +1,7 @@
 """
 note記事AI自動生成ツール - Web管理画面
+
+マルチユーザー対応・FFMV ティアシステム付き
 """
 
 from __future__ import annotations
@@ -21,6 +23,23 @@ from src.generator.style_profile import StyleAnalyzer, StyleProfile
 from src.ingester.text_ingester import TextIngester
 from src.ingester.url_ingester import URLIngester
 from src.output.markdown_writer import MarkdownWriter
+
+from src.auth.auth_manager import AuthManager
+from src.auth.tier_gate import TierGate
+from src.web.auth_pages import render_auth_page, render_account_page
+from src.web.tier_pages import (
+    page_plans,
+    page_contact,
+    page_admin,
+    render_shared_articles,
+    generate_share_token,
+)
+from src.web.upgrade_prompts import (
+    render_quota_exhausted,
+    render_feature_locked,
+    render_upgrade_banner,
+    render_quota_sidebar,
+)
 
 # ---------------------------------------------------------------------------
 # ページ設定
@@ -306,7 +325,6 @@ st.markdown("""
         background-color: #f7f9fa !important;
         color: #08131a !important;
     }
-    /* react-json-view 対策 */
     .react-json-view {
         background-color: #f7f9fa !important;
         color: #08131a !important;
@@ -397,7 +415,13 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 
 def init_session_state():
-    defaults = {"settings": None, "db": None, "page": "dashboard", "proposed_topics": None}
+    defaults = {
+        "settings": None,
+        "db": None,
+        "page": "dashboard",
+        "proposed_topics": None,
+        "user": None,
+    }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
@@ -422,6 +446,20 @@ def get_db() -> Database | None:
         st.session_state.db = db
     return st.session_state.db
 
+def get_user():
+    return st.session_state.get("user")
+
+def get_user_id() -> int | None:
+    user = get_user()
+    return user["id"] if user else None
+
+def get_tier_gate() -> TierGate | None:
+    user = get_user()
+    db = get_db()
+    if not user or not db:
+        return None
+    return TierGate(db, user)
+
 
 # ---------------------------------------------------------------------------
 # サイドバー
@@ -435,6 +473,12 @@ def render_sidebar():
             '</div>',
             unsafe_allow_html=True,
         )
+
+        # ユーザー情報・クォータ表示
+        gate = get_tier_gate()
+        if gate:
+            render_quota_sidebar(gate)
+
         st.markdown("---")
 
         nav = {
@@ -443,6 +487,8 @@ def render_sidebar():
             "articles":  "記事一覧",
             "style":     "スタイル設定",
             "sources":   "ソース管理",
+            "plans":     "プラン比較",
+            "account":   "アカウント",
             "settings_page": "設定",
         }
         for key, label in nav.items():
@@ -450,12 +496,24 @@ def render_sidebar():
                 st.session_state.page = key
                 st.rerun()
 
+        # 管理者メニュー
+        user = get_user()
+        if user and user.get("is_admin"):
+            st.markdown("---")
+            if st.button("管理画面", key="nav_admin", use_container_width=True):
+                st.session_state.page = "admin"
+                st.rerun()
+
         st.markdown("---")
         s = get_settings()
         if s:
             db = get_db()
-            if db:
-                cnt = db.fetch_one("SELECT COUNT(*) as cnt FROM generated_articles")["cnt"]
+            uid = get_user_id()
+            if db and uid:
+                cnt = db.fetch_one(
+                    "SELECT COUNT(*) as cnt FROM generated_articles WHERE user_id = ?",
+                    (uid,),
+                )["cnt"]
                 st.markdown(
                     f'<div class="sidebar-info">'
                     f'モデル: {s.model_name}<br>'
@@ -484,16 +542,22 @@ ARTICLE_CATEGORIES = [
 
 
 def ensure_sources_loaded(db):
-    """data/sources/ のファイルが未取り込みならDBに自動インポート"""
+    """data/sources/ のファイルが未取り込みならDBに自動インポート（管理者のみ）"""
     if db is None:
         return
-    cnt = db.fetch_one("SELECT COUNT(*) as cnt FROM sources")["cnt"]
+    user = get_user()
+    if not user or not user.get("is_admin"):
+        return
+    uid = user["id"]
+    cnt = db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM sources WHERE user_id = ?", (uid,)
+    )["cnt"]
     if cnt > 0:
         return
-    _auto_crawl_sources(db)
+    _auto_crawl_sources(db, uid)
 
 
-def _auto_crawl_sources(db):
+def _auto_crawl_sources(db, user_id: int):
     """data/sources/ からソースを自動取り込み"""
     sources_dir = PROJECT_ROOT / "data" / "sources"
     if not sources_dir.exists():
@@ -516,8 +580,8 @@ def _auto_crawl_sources(db):
         content = f.read_text(encoding="utf-8")
         title = title_map.get(f.stem, f.stem)
         db.execute(
-            "INSERT INTO sources (type, title, content) VALUES (?, ?, ?)",
-            ("file", title, content),
+            "INSERT INTO sources (type, title, content, user_id) VALUES (?, ?, ?, ?)",
+            ("file", title, content, user_id),
         )
         bar.progress((i + 1) / len(files))
     st.success(f"{len(files)}件のソースを自動取り込みしました")
@@ -534,12 +598,29 @@ def _categorize_article(title: str, topic: str) -> str:
     return "日常エッセイ・時事"
 
 
+def _append_cta(body: str) -> str:
+    """記事末尾にメルマガ/LINE CTAを追加"""
+    user = get_user()
+    if not user:
+        return body
+    cta = user.get("newsletter_cta_text", "")
+    if not cta:
+        return body
+    return body + "\n\n" + cta
+
+
 def _run_batch_generation(s, db, topics, sel_prof, prof_map, target, source_content):
     """バッチ記事生成の実行"""
+    uid = get_user_id()
+    gate = get_tier_gate()
+
     style_profile = None
     pid = prof_map[sel_prof]
     if pid is not None:
-        row = db.fetch_one("SELECT name, profile FROM style_profiles WHERE id = ?", (pid,))
+        row = db.fetch_one(
+            "SELECT name, profile FROM style_profiles WHERE id = ? AND user_id = ?",
+            (pid, uid),
+        )
         if row:
             style_profile = StyleProfile.from_json(row["name"], row["profile"])
 
@@ -564,12 +645,21 @@ def _run_batch_generation(s, db, topics, sel_prof, prof_map, target, source_cont
                 min_length=max(target - 500, 1000),
                 max_length=target + 1000,
             )
+            # メルマガCTAを追加（有料プランのみ）
+            if gate and gate.tier != "free":
+                result["body"] = _append_cta(result["body"])
+
             generated.append(result)
             db.execute(
-                "INSERT INTO generated_articles (title, content, topic, word_count, status) VALUES (?, ?, ?, ?, ?)",
-                (result["title"], result["body"], topic, result["word_count"], "draft"),
+                "INSERT INTO generated_articles "
+                "(title, content, topic, word_count, status, user_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (result["title"], result["body"], topic, result["word_count"], "draft", uid),
             )
-            writer.write_article(title=result["title"], body=result["body"], hashtags=result.get("hashtags"))
+            writer.write_article(
+                title=result["title"], body=result["body"],
+                hashtags=result.get("hashtags"),
+            )
             with out:
                 st.success(f"{result['title']}  ({result['word_count']:,}文字)")
         except Exception as e:
@@ -580,15 +670,20 @@ def _run_batch_generation(s, db, topics, sel_prof, prof_map, target, source_cont
 
     bar.progress(1.0)
     stat.markdown("**生成完了**")
-    if generated:
-        total = sum(a["word_count"] for a in generated)
+
+    # 利用量記録
+    if generated and gate:
+        total_chars = sum(a["word_count"] for a in generated)
+        gate.record_generation(count=len(generated), chars=total_chars)
         st.markdown(
-            f"**生成結果:** {len(generated)}件 / 合計 {total:,}文字 / 平均 {total // len(generated):,}文字"
+            f"**生成結果:** {len(generated)}件 / 合計 {total_chars:,}文字 / "
+            f"平均 {total_chars // len(generated):,}文字"
         )
+
     st.session_state["proposed_topics"] = None
 
 
-def _render_article_plan(db, articles_count):
+def _render_article_plan(db, articles_count, user_id):
     """1,000記事プランの進捗表示"""
     st.markdown('<div class="section-title">1,000記事プラン</div>', unsafe_allow_html=True)
 
@@ -599,7 +694,10 @@ def _render_article_plan(db, articles_count):
         unsafe_allow_html=True,
     )
 
-    all_articles = db.fetch_all("SELECT title, topic FROM generated_articles")
+    all_articles = db.fetch_all(
+        "SELECT title, topic FROM generated_articles WHERE user_id = ?",
+        (user_id,),
+    )
     cat_counts = {}
     for a in all_articles:
         cat = _categorize_article(a["title"] or "", a["topic"] or "")
@@ -627,11 +725,29 @@ def page_dashboard():
         st.error(".env にAPIキーが設定されていません。「設定」ページから設定してください。")
         return
     db = get_db()
+    uid = get_user_id()
+    gate = get_tier_gate()
 
-    articles_count = db.fetch_one("SELECT COUNT(*) as cnt FROM generated_articles")["cnt"]
-    sources_count = db.fetch_one("SELECT COUNT(*) as cnt FROM sources")["cnt"]
-    profiles_count = db.fetch_one("SELECT COUNT(*) as cnt FROM style_profiles")["cnt"]
-    total_chars = db.fetch_one("SELECT COALESCE(SUM(word_count),0) as t FROM generated_articles")["t"]
+    # Freeユーザー向けアップグレードバナー
+    if gate and gate.tier == "free":
+        render_upgrade_banner()
+
+    articles_count = db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM generated_articles WHERE user_id = ?",
+        (uid,),
+    )["cnt"]
+    sources_count = db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM sources WHERE user_id = ?",
+        (uid,),
+    )["cnt"]
+    profiles_count = db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM style_profiles WHERE user_id = ?",
+        (uid,),
+    )["cnt"]
+    total_chars = db.fetch_one(
+        "SELECT COALESCE(SUM(word_count),0) as t FROM generated_articles WHERE user_id = ?",
+        (uid,),
+    )["t"]
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -651,7 +767,9 @@ def page_dashboard():
         st.markdown('<div class="section-title">最近の記事</div>', unsafe_allow_html=True)
         recent = db.fetch_all(
             "SELECT id, title, word_count, status, created_at "
-            "FROM generated_articles ORDER BY created_at DESC LIMIT 8"
+            "FROM generated_articles WHERE user_id = ? "
+            "ORDER BY created_at DESC LIMIT 8",
+            (uid,),
         )
         if recent:
             for row in recent:
@@ -687,6 +805,15 @@ def page_dashboard():
             st.session_state.page = "sources"
             st.rerun()
 
+        # 記事共有リンク
+        st.markdown("")
+        st.markdown('<div class="section-title">記事共有</div>', unsafe_allow_html=True)
+        if st.button("共有リンクを発行", use_container_width=True):
+            token = generate_share_token(db, uid)
+            share_url = f"?share={token}"
+            st.code(share_url, language=None)
+            st.info("このURLを共有すると、記事一覧を読み取り専用で閲覧できます。")
+
 
 # ---------------------------------------------------------------------------
 # 記事生成
@@ -700,12 +827,26 @@ def page_generate():
         st.error("APIキーが設定されていません。「設定」ページから設定してください。")
         return
     db = get_db()
+    uid = get_user_id()
+    gate = get_tier_gate()
+
     ensure_sources_loaded(db)
 
+    # --- クォータチェック ---
+    if gate and not gate.can_generate():
+        render_quota_exhausted(gate)
+        return
+
     # --- ソース概要 ---
-    sources = db.fetch_all("SELECT id, title, content FROM sources ORDER BY created_at DESC")
+    sources = db.fetch_all(
+        "SELECT id, title, content FROM sources WHERE user_id = ? ORDER BY created_at DESC",
+        (uid,),
+    )
     total_chars = sum(len(r["content"]) for r in sources)
-    articles_count = db.fetch_one("SELECT COUNT(*) as cnt FROM generated_articles")["cnt"]
+    articles_count = db.fetch_one(
+        "SELECT COUNT(*) as cnt FROM generated_articles WHERE user_id = ?",
+        (uid,),
+    )["cnt"]
     remaining = max(1000 - articles_count, 0)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -725,31 +866,41 @@ def page_generate():
             f'<div class="label">生成済み</div></div>', unsafe_allow_html=True,
         )
     with c4:
+        # 残りクォータ表示
+        quota = gate.remaining_quota() if gate else 0
+        quota_str = "無制限" if quota == -1 else str(quota)
         st.markdown(
-            f'<div class="stat-card gray"><div class="num">{remaining}</div>'
-            f'<div class="label">目標まで</div></div>', unsafe_allow_html=True,
+            f'<div class="stat-card gray"><div class="num">{quota_str}</div>'
+            f'<div class="label">残りクォータ</div></div>', unsafe_allow_html=True,
         )
 
     if not sources:
-        st.warning("ソースが未登録です。自動収集を実行してコンテンツを取り込みます。")
-        if st.button("SNSから自動収集する", type="primary"):
-            _auto_crawl_sources(db)
+        st.warning("ソースが未登録です。「ソース管理」からコンテンツを取り込んでください。")
+        if st.button("ソース管理へ", type="primary"):
+            st.session_state.page = "sources"
+            st.rerun()
         return
 
     st.markdown("---")
 
-    # --- 生成設定（コンパクト） ---
+    # --- 生成設定（ティア制限付き） ---
+    max_batch = gate.max_batch_size() if gate else 1
+    max_chars = gate.max_target_chars() if gate else 2000
+
     col_s1, col_s2, col_s3, col_s4 = st.columns(4)
     with col_s1:
-        profiles = db.fetch_all("SELECT id, name FROM style_profiles ORDER BY created_at DESC")
+        profiles = db.fetch_all(
+            "SELECT id, name FROM style_profiles WHERE user_id = ? ORDER BY created_at DESC",
+            (uid,),
+        )
         prof_map = {"デフォルト": None}
         for p in profiles:
             prof_map[p["name"]] = p["id"]
         sel_prof = st.selectbox("スタイル", list(prof_map.keys()))
     with col_s2:
-        batch_size = st.slider("生成数", 1, 50, 10)
+        batch_size = st.slider("生成数", 1, max_batch, min(10, max_batch))
     with col_s3:
-        target = st.slider("目標文字数", 1000, 5000, 2000, step=500)
+        target = st.slider("目標文字数", 1000, max_chars, min(2000, max_chars), step=500)
     with col_s4:
         model_short = s.model_name.replace("claude-", "").split("-2025")[0]
         st.markdown(
@@ -794,6 +945,15 @@ def page_generate():
                 selected_topics.append(t)
 
         st.markdown("---")
+
+        # クォータ超過チェック
+        if gate and not gate.can_generate(len(selected_topics)):
+            remaining_q = gate.remaining_quota()
+            st.warning(
+                f"選択数が残りクォータ（{remaining_q}本）を超えています。"
+                f"{remaining_q}本以下に減らしてください。"
+            )
+
         new_total = articles_count + len(selected_topics)
         st.markdown(
             f'<div class="goal-text">'
@@ -806,6 +966,8 @@ def page_generate():
         if st.button("選択したトピックで生成する", type="primary", use_container_width=True):
             if not selected_topics:
                 st.warning("トピックを1つ以上選択してください。")
+            elif gate and not gate.can_generate(len(selected_topics)):
+                st.error("クォータ不足のため生成できません。")
             else:
                 _run_batch_generation(
                     s, db, selected_topics, sel_prof, prof_map, target, source_summary,
@@ -818,7 +980,7 @@ def page_generate():
 
     # --- 1,000記事プラン ---
     st.markdown("---")
-    _render_article_plan(db, articles_count)
+    _render_article_plan(db, articles_count, uid)
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +990,8 @@ def page_generate():
 def page_articles():
     st.markdown('<div class="page-header">記事一覧</div>', unsafe_allow_html=True)
     db = get_db()
-    if not db:
+    uid = get_user_id()
+    if not db or not uid:
         return
 
     c1, c2, c3 = st.columns([2, 1, 1])
@@ -839,8 +1002,8 @@ def page_articles():
     with c3:
         sort_f = st.selectbox("並び順", ["新しい順", "古い順", "文字数順"])
 
-    q = "SELECT * FROM generated_articles WHERE 1=1"
-    p = []
+    q = "SELECT * FROM generated_articles WHERE user_id = ?"
+    p: list = [uid]
     if search:
         q += " AND title LIKE ?"
         p.append(f"%{search}%")
@@ -868,7 +1031,9 @@ def page_articles():
             cy, cn = st.columns(2)
             with cy:
                 if st.button("削除する", type="primary"):
-                    db.execute("DELETE FROM generated_articles")
+                    db.execute(
+                        "DELETE FROM generated_articles WHERE user_id = ?", (uid,)
+                    )
                     st.session_state["confirm_delete_all"] = False
                     st.rerun()
             with cn:
@@ -895,18 +1060,29 @@ def page_articles():
                 with cs:
                     if st.button("保存", key=f"sv_{a['id']}", type="primary"):
                         db.execute(
-                            "UPDATE generated_articles SET title=?, content=?, status=?, word_count=? WHERE id=?",
-                            (nt, nc, ns, len(nc), a["id"]),
+                            "UPDATE generated_articles SET title=?, content=?, status=?, word_count=? "
+                            "WHERE id=? AND user_id=?",
+                            (nt, nc, ns, len(nc), a["id"], uid),
                         )
                         st.success("保存しました")
                         st.rerun()
                 with cd:
                     if st.button("削除", key=f"dl_{a['id']}"):
-                        db.execute("DELETE FROM generated_articles WHERE id=?", (a["id"],))
+                        db.execute(
+                            "DELETE FROM generated_articles WHERE id=? AND user_id=?",
+                            (a["id"], uid),
+                        )
                         st.rerun()
             with tm:
-                st.json({"id": a["id"], "topic": a["topic"], "word_count": a["word_count"], "status": a["status"], "created_at": a["created_at"]})
-                st.text_area("note.com貼り付け用", value=a["content"], height=200, key=f"cp_{a['id']}")
+                st.json({
+                    "id": a["id"], "topic": a["topic"],
+                    "word_count": a["word_count"], "status": a["status"],
+                    "created_at": a["created_at"],
+                })
+                st.text_area(
+                    "note.com貼り付け用", value=a["content"],
+                    height=200, key=f"cp_{a['id']}",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -919,8 +1095,13 @@ def page_style():
     if not s:
         return
     db = get_db()
+    uid = get_user_id()
+    gate = get_tier_gate()
 
-    profiles = db.fetch_all("SELECT * FROM style_profiles ORDER BY created_at DESC")
+    profiles = db.fetch_all(
+        "SELECT * FROM style_profiles WHERE user_id = ? ORDER BY created_at DESC",
+        (uid,),
+    )
     if profiles:
         st.markdown('<div class="section-title">登録済みプロファイル</div>', unsafe_allow_html=True)
         for p in profiles:
@@ -935,49 +1116,127 @@ def page_style():
                     st.markdown(f"**ライティング指示:**\n\n{instr}")
                 st.json(pd)
                 if st.button("削除", key=f"dp_{p['id']}"):
-                    db.execute("DELETE FROM style_profiles WHERE id=?", (p["id"],))
+                    db.execute(
+                        "DELETE FROM style_profiles WHERE id=? AND user_id=?",
+                        (p["id"], uid),
+                    )
                     st.rerun()
 
     st.markdown("---")
-    st.markdown('<div class="section-title">新規プロファイル作成</div>', unsafe_allow_html=True)
 
-    author = st.text_input("著者名", value="山崎拓巳")
-    src_type = st.radio("分析ソース", ["テキスト入力", "URLから取得"], horizontal=True)
-
-    if src_type == "テキスト入力":
-        sample = st.text_area(
-            "分析対象テキスト",
-            placeholder="著者の文章を貼り付けてください。\n--- で区切ると複数記事として認識します。",
-            height=280,
-        )
-    else:
-        style_urls = st.text_area("URL（1行1つ）", placeholder="https://ameblo.jp/...", height=110)
-
-    if st.button("スタイルを分析する", type="primary"):
-        texts = []
-        if src_type == "テキスト入力" and sample.strip():
-            texts = [t.strip() for t in sample.split("---") if t.strip()]
-        elif src_type == "URLから取得" and style_urls.strip():
-            with st.spinner("URLからコンテンツを取得中..."):
-                ing = URLIngester(request_delay=1.0)
-                for u in style_urls.strip().split("\n"):
-                    u = u.strip()
-                    if u:
-                        res = ing.ingest(u)
-                        texts.extend(r.content for r in res)
-        if not texts:
-            st.warning("分析対象のテキストを入力してください。")
+    # --- カスタムスタイル作成（ティアゲート） ---
+    if gate and not gate.can_use_custom_style():
+        limit = gate.custom_style_limit()
+        if limit == 0:
+            render_feature_locked("カスタムスタイル作成", "Front")
         else:
-            with st.spinner(f"{len(texts)}件のテキストを分析中..."):
-                ana = StyleAnalyzer(api_key=s.anthropic_api_key, model=s.model_name)
-                prof = ana.analyze_sync(texts[:5], author)
-            st.success(f"プロファイル「{author}」を作成しました")
-            st.json(prof.profile_data)
-            db.execute(
-                "INSERT INTO style_profiles (name, profile, source_articles) VALUES (?, ?, ?)",
-                (author, prof.to_json(), json.dumps([t[:200] for t in texts[:5]], ensure_ascii=False)),
+            st.warning(
+                f"スタイル上限（{limit}つ）に達しています。"
+                "既存のプロファイルを削除するか、プランをアップグレードしてください。"
             )
-            st.rerun()
+    else:
+        st.markdown('<div class="section-title">新規プロファイル作成</div>', unsafe_allow_html=True)
+
+        author = st.text_input("著者名", value="山崎拓巳")
+        src_type = st.radio(
+            "分析ソース",
+            ["テキスト入力", "A→Bリライト学習", "URLから取得"],
+            horizontal=True,
+        )
+
+        if src_type == "テキスト入力":
+            sample = st.text_area(
+                "分析対象テキスト",
+                placeholder="著者の文章を貼り付けてください。\n--- で区切ると複数記事として認識します。",
+                height=280,
+            )
+        elif src_type == "A→Bリライト学習":
+            st.markdown("""
+            **A→Bリライト学習とは：**
+            AIが生成した文章（A原稿）と、あなたがリライトした文章（B原稿）のペアを入力すると、
+            AIがその違いを学習してあなたのスタイルに寄せた文章を生成するようになります。
+            **3〜4本のペアで十分な学習が可能です。**
+            """)
+            ab_pairs = []
+            num_pairs = st.number_input(
+                "ペア数", min_value=1, max_value=10, value=3, step=1
+            )
+            for idx in range(int(num_pairs)):
+                st.markdown(f"**ペア {idx+1}**")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    a_text = st.text_area(
+                        f"A原稿（AI生成）",
+                        height=200,
+                        key=f"ab_a_{idx}",
+                        placeholder="AIが生成した元の文章を貼り付け",
+                    )
+                with col_b:
+                    b_text = st.text_area(
+                        f"B原稿（あなたのリライト）",
+                        height=200,
+                        key=f"ab_b_{idx}",
+                        placeholder="あなたがリライトした文章を貼り付け",
+                    )
+                if a_text.strip() and b_text.strip():
+                    ab_pairs.append((a_text.strip(), b_text.strip()))
+                st.markdown("---")
+        else:
+            style_urls = st.text_area(
+                "URL（1行1つ）", placeholder="https://ameblo.jp/...", height=110
+            )
+
+            # URL取込のティアチェック
+            if gate and not gate.can_use_url_ingestion():
+                render_feature_locked("URL取込", "Middle")
+
+        if st.button("スタイルを分析する", type="primary"):
+            texts = []
+
+            if src_type == "テキスト入力" and sample.strip():
+                texts = [t.strip() for t in sample.split("---") if t.strip()]
+
+            elif src_type == "A→Bリライト学習":
+                if not ab_pairs:
+                    st.warning("A原稿とB原稿のペアを1つ以上入力してください。")
+                else:
+                    # A→B形式でスタイル分析用テキストを構築
+                    for a_text, b_text in ab_pairs:
+                        texts.append(
+                            f"【元の文章（A原稿）】\n{a_text}\n\n"
+                            f"【リライト後（B原稿）】\n{b_text}"
+                        )
+
+            elif src_type == "URLから取得" and style_urls.strip():
+                if gate and not gate.can_use_url_ingestion():
+                    st.error("URL取込はMiddleプラン以上で利用可能です。")
+                    texts = []
+                else:
+                    with st.spinner("URLからコンテンツを取得中..."):
+                        ing = URLIngester(request_delay=1.0)
+                        for u in style_urls.strip().split("\n"):
+                            u = u.strip()
+                            if u:
+                                res = ing.ingest(u)
+                                texts.extend(r.content for r in res)
+
+            if texts:
+                with st.spinner(f"{len(texts)}件のテキストを分析中..."):
+                    ana = StyleAnalyzer(api_key=s.anthropic_api_key, model=s.model_name)
+                    prof = ana.analyze_sync(texts[:5], author)
+                st.success(f"プロファイル「{author}」を作成しました")
+                st.json(prof.profile_data)
+                db.execute(
+                    "INSERT INTO style_profiles (name, profile, source_articles, user_id) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        author,
+                        prof.to_json(),
+                        json.dumps([t[:200] for t in texts[:5]], ensure_ascii=False),
+                        uid,
+                    ),
+                )
+                st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -987,18 +1246,29 @@ def page_style():
 def page_sources():
     st.markdown('<div class="page-header">ソース管理</div>', unsafe_allow_html=True)
     db = get_db()
-    if not db:
+    uid = get_user_id()
+    gate = get_tier_gate()
+    if not db or not uid:
         return
 
     st.markdown('<div class="section-title">ソースを追加</div>', unsafe_allow_html=True)
-    add_type = st.radio("追加方法", ["テキスト入力", "URL取得", "ファイルアップロード"], horizontal=True)
+
+    # URL取得はティアゲート
+    add_options = ["テキスト入力", "ファイルアップロード"]
+    if gate and gate.can_use_url_ingestion():
+        add_options.insert(1, "URL取得")
+
+    add_type = st.radio("追加方法", add_options, horizontal=True)
 
     if add_type == "テキスト入力":
         title = st.text_input("タイトル", placeholder="例: 山崎拓巳 講演メモ")
         content = st.text_area("コンテンツ", height=280, placeholder="テキストを入力...")
         if st.button("追加する", type="primary"):
             if title and content:
-                db.execute("INSERT INTO sources (type, title, content) VALUES (?, ?, ?)", ("text", title, content))
+                db.execute(
+                    "INSERT INTO sources (type, title, content, user_id) VALUES (?, ?, ?, ?)",
+                    ("text", title, content, uid),
+                )
                 st.success(f"「{title}」を追加しました")
                 st.rerun()
 
@@ -1015,34 +1285,56 @@ def page_sources():
                     with st.spinner(f"取得中: {u[:60]}..."):
                         res = ing.ingest(u)
                         for r in res:
-                            db.execute("INSERT INTO sources (type, title, content, url) VALUES (?, ?, ?, ?)", ("url", r.title, r.content, r.url))
+                            db.execute(
+                                "INSERT INTO sources (type, title, content, url, user_id) "
+                                "VALUES (?, ?, ?, ?, ?)",
+                                ("url", r.title, r.content, r.url, uid),
+                            )
                             added += 1
                 st.success(f"{added}件のソースを追加しました")
                 st.rerun()
 
     elif add_type == "ファイルアップロード":
-        uploaded = st.file_uploader("テキストファイル", type=["txt", "md"], accept_multiple_files=True)
+        uploaded = st.file_uploader(
+            "テキストファイル", type=["txt", "md"], accept_multiple_files=True
+        )
         if uploaded and st.button("追加する", type="primary"):
             for f in uploaded:
                 c = f.read().decode("utf-8", errors="replace")
-                db.execute("INSERT INTO sources (type, title, content) VALUES (?, ?, ?)", ("text", f.name, c))
+                db.execute(
+                    "INSERT INTO sources (type, title, content, user_id) VALUES (?, ?, ?, ?)",
+                    ("text", f.name, c, uid),
+                )
             st.success(f"{len(uploaded)}ファイルを追加しました")
             st.rerun()
 
+    # URL取得がロックされている場合の表示
+    if gate and not gate.can_use_url_ingestion():
+        render_feature_locked("URL取込", "Middle")
+
     st.markdown("---")
     st.markdown('<div class="section-title">登録済みソース</div>', unsafe_allow_html=True)
-    sources = db.fetch_all("SELECT * FROM sources ORDER BY created_at DESC")
+    sources = db.fetch_all(
+        "SELECT * FROM sources WHERE user_id = ? ORDER BY created_at DESC",
+        (uid,),
+    )
     if not sources:
         st.info("ソースが登録されていません。")
         return
     st.markdown(f"**{len(sources)}件**のソース")
     for src in sources:
         with st.expander(f"{src['title']}  ({src['type']} / {src['created_at']})"):
-            st.text_area("内容", value=src["content"][:3000], height=180, key=f"sr_{src['id']}", disabled=True)
+            st.text_area(
+                "内容", value=src["content"][:3000], height=180,
+                key=f"sr_{src['id']}", disabled=True,
+            )
             if src["url"]:
                 st.markdown(f"URL: {src['url']}")
             if st.button("削除", key=f"ds_{src['id']}"):
-                db.execute("DELETE FROM sources WHERE id=?", (src["id"],))
+                db.execute(
+                    "DELETE FROM sources WHERE id=? AND user_id=?",
+                    (src["id"], uid),
+                )
                 st.rerun()
 
 
@@ -1069,14 +1361,18 @@ def page_settings():
         "claude-sonnet-4-5-20250514",
         "claude-3-5-sonnet-20241022",
     ])
-    out_dir = st.text_input("出力ディレクトリ", value=cur.get("NOTE_GENERATOR_OUTPUT_DIR", "data/output"))
+    out_dir = st.text_input(
+        "出力ディレクトリ", value=cur.get("NOTE_GENERATOR_OUTPUT_DIR", "data/output")
+    )
 
     if st.button("設定を保存", type="primary"):
         env_path.write_text(
             f"ANTHROPIC_API_KEY={api_key}\n"
             f"NOTE_GENERATOR_MODEL={model}\n"
             f"NOTE_GENERATOR_DB_PATH={cur.get('NOTE_GENERATOR_DB_PATH', 'data/note_generator.db')}\n"
-            f"NOTE_GENERATOR_OUTPUT_DIR={out_dir}\n",
+            f"NOTE_GENERATOR_OUTPUT_DIR={out_dir}\n"
+            f"ADMIN_EMAIL={cur.get('ADMIN_EMAIL', '')}\n"
+            f"ADMIN_PASSWORD={cur.get('ADMIN_PASSWORD', '')}\n",
             encoding="utf-8",
         )
         st.session_state.settings = None
@@ -1089,9 +1385,15 @@ def page_settings():
     s = get_settings()
     if s:
         db = get_db()
+        uid = get_user_id()
         st.markdown(f"パス: `{s.db_path}`")
         for tbl in ["sources", "style_profiles", "generated_articles", "scrape_cache"]:
-            cnt = db.fetch_one(f"SELECT COUNT(*) as cnt FROM {tbl}")["cnt"]
+            cnt = db.fetch_one(
+                f"SELECT COUNT(*) as cnt FROM {tbl} WHERE user_id = ?",
+                (uid,),
+            )["cnt"] if tbl != "scrape_cache" else db.fetch_one(
+                f"SELECT COUNT(*) as cnt FROM {tbl}"
+            )["cnt"]
             st.markdown(f"- {tbl}: **{cnt}** 行")
 
 
@@ -1101,11 +1403,56 @@ def page_settings():
 
 def main():
     init_session_state()
+
+    # 共有リンクモード
+    params = st.query_params
+    share_token = params.get("share")
+    if share_token:
+        db = get_db()
+        if db:
+            render_shared_articles(db, share_token)
+        return
+
+    # DB初期化 & 管理者セットアップ
+    db = get_db()
+    if db:
+        auth = AuthManager(db)
+        auth.ensure_admin()
+
+    # 認証ゲート
+    user = get_user()
+    if not user:
+        if db:
+            render_auth_page(db)
+        else:
+            st.error(
+                "データベースの初期化に失敗しました。"
+                "「設定」からAPIキーを確認してください。"
+            )
+        return
+
+    # ユーザー情報を最新に更新
+    if db:
+        fresh = db.fetch_one("SELECT * FROM users WHERE id = ?", (user["id"],))
+        if fresh:
+            st.session_state["user"] = dict(fresh)
+
     render_sidebar()
+
+    page_map = {
+        "dashboard": page_dashboard,
+        "generate": page_generate,
+        "articles": page_articles,
+        "style": page_style,
+        "sources": page_sources,
+        "plans": page_plans,
+        "contact": page_contact,
+        "account": lambda: render_account_page(db),
+        "admin": lambda: page_admin(db),
+        "settings_page": page_settings,
+    }
     p = st.session_state.page
-    {"dashboard": page_dashboard, "generate": page_generate, "articles": page_articles,
-     "style": page_style, "sources": page_sources, "settings_page": page_settings,
-    }.get(p, page_dashboard)()
+    page_map.get(p, page_dashboard)()
 
 if __name__ == "__main__":
     main()

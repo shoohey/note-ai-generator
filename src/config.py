@@ -65,7 +65,8 @@ class Settings:
             import streamlit as st
             if hasattr(st, "secrets"):
                 for key in ["ANTHROPIC_API_KEY", "NOTE_GENERATOR_MODEL",
-                            "NOTE_GENERATOR_DB_PATH", "NOTE_GENERATOR_OUTPUT_DIR"]:
+                            "NOTE_GENERATOR_DB_PATH", "NOTE_GENERATOR_OUTPUT_DIR",
+                            "ADMIN_EMAIL", "ADMIN_PASSWORD"]:
                     if key in st.secrets and not os.getenv(key):
                         os.environ[key] = st.secrets[key]
         except Exception:

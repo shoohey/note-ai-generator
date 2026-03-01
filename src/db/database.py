@@ -47,6 +47,7 @@ class Database:
         - WALモードを有効化する
         - 外部キー制約を有効化する
         - schema.sql を実行してテーブルを作成する
+        - マイグレーションを実行する（v2: ユーザー・ティア管理）
         """
         # 親ディレクトリの作成
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +63,10 @@ class Database:
             # テーブル作成
             conn.executescript(schema_sql)
             conn.commit()
+
+            # マイグレーション実行（v2: ユーザー・ティア管理）
+            from src.db.migrations import migrate
+            migrate(conn)
 
     # ------------------------------------------------------------------
     # 接続管理
